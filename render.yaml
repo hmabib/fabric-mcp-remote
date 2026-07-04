@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: fabric-mcp-remote
+    runtime: docker
+    plan: starter
+    region: oregon
+    envVars:
+      - key: AZURE_TENANT_ID
+        sync: false
+      - key: AZURE_CLIENT_ID
+        sync: false
+      - key: AZURE_CLIENT_SECRET
+        sync: false
+      - key: MCP_API_KEY
+        sync: false
+      - key: MCP_LOG_LEVEL
+        value: INFO
+      - key: FABRIC_API_CALL_TIMEOUT
+        value: "60"
+    healthCheckPath: /health
+    numInstances: 1
