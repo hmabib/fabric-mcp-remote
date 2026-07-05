@@ -1,11 +1,11 @@
 """
 Fabric MCP Remote Server — Wrapper to expose ms-fabric-mcp-server over HTTP on Render.
 
-This wraps the existing ms-fabric-mcp-server package with:
+This wraps the existing ms-fabric_mcp_server package with:
 - Streamable HTTP transport (remote access via mcp-remote)
 - Bearer token authentication (StaticTokenVerifier)
 - CORS middleware (browser clients)
-- Azure env var mapping (FABRIC_* → AZURE_* for DefaultAzureCredential)
+- Azure auth via refresh token (no admin consent needed)
 - Health check endpoint for Render monitoring
 """
 
@@ -14,28 +14,106 @@ import secrets
 import logging
 
 import uvicorn
+import msal
 from ms_fabric_mcp_server import create_fabric_server
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.responses import JSONResponse
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from azure.core.credentials import AccessToken
 
 logger = logging.getLogger(__name__)
 
+# Azure CLI public client ID (same as az login uses)
+AZURE_CLI_CLIENT_ID = "04b07795-a71b-4346-935f-02f9a1efa4ce"
+FABRIC_SCOPES = ["https://api.fabric.microsoft.com/.default"]
+POWERBI_SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
+
+
+class RefreshTokenCredential:
+    """Azure credential that uses a refresh token from az login.
+
+    This authenticates as the user (delegated permissions) instead of a
+    service principal (application permissions), so no admin consent is needed.
+    The refresh token is automatically rotated by MSAL.
+    """
+
+    def __init__(self, tenant_id: str, client_id: str, refresh_token: str):
+        self._tenant_id = tenant_id
+        self._client_id = client_id
+        self._refresh_token = refresh_token
+        authority = f"https://login.microsoftonline.com/{tenant_id}"
+        self._app = msal.PublicClientApplication(
+            client_id=client_id, authority=authority
+        )
+        logger.info(f"RefreshTokenCredential initialized for tenant {tenant_id}")
+
+    def get_token(self, *scopes, **kwargs):
+        """Acquire an access token using the refresh token."""
+        scope_list = list(scopes) if scopes else FABRIC_SCOPES
+
+        # Try the cached refresh token
+        result = self._app.acquire_token_by_refresh_token(
+            self._refresh_token, scopes=scope_list
+        )
+
+        if "error" in result:
+            logger.warning(
+                f"Refresh token exchange failed: {result.get('error_description', result['error'])}"
+            )
+            raise Exception(f"Auth failed: {result.get('error_description', result['error'])}")
+
+        # Save the new refresh token for next call (MSAL rotates them)
+        if "refresh_token" in result:
+            self._refresh_token = result["refresh_token"]
+            logger.debug("Refresh token rotated successfully")
+
+        access_token = result["access_token"]
+        expires_in = result.get("expires_in", 3600)
+        import time
+        return AccessToken(access_token, int(time.time()) + expires_in)
+
 
 def main():
-    # 0. Map FABRIC_* env vars to AZURE_* for DefaultAzureCredential
-    # DefaultAzureCredential reads AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
-    # but our config uses FABRIC_* prefix — bridge them here
-    if os.environ.get("FABRIC_TENANT_ID") and not os.environ.get("AZURE_TENANT_ID"):
-        os.environ["AZURE_TENANT_ID"] = os.environ["FABRIC_TENANT_ID"]
-        logger.info("Mapped FABRIC_TENANT_ID → AZURE_TENANT_ID")
-    if os.environ.get("FABRIC_CLIENT_ID") and not os.environ.get("AZURE_CLIENT_ID"):
-        os.environ["AZURE_CLIENT_ID"] = os.environ["FABRIC_CLIENT_ID"]
-        logger.info("Mapped FABRIC_CLIENT_ID → AZURE_CLIENT_ID")
-    if os.environ.get("FABRIC_CLIENT_SECRET") and not os.environ.get("AZURE_CLIENT_SECRET"):
-        os.environ["AZURE_CLIENT_SECRET"] = os.environ["FABRIC_CLIENT_SECRET"]
-        logger.info("Mapped FABRIC_CLIENT_SECRET → AZURE_CLIENT_SECRET")
+    # 0. Set up Azure authentication via refresh token
+    tenant_id = os.environ.get("AZURE_TENANT_ID", "")
+    refresh_token = os.environ.get("AZURE_REFRESH_TOKEN", "")
+
+    if refresh_token and tenant_id:
+        # Use refresh token credential (delegated permissions, no admin consent needed)
+        credential = RefreshTokenCredential(
+            tenant_id=tenant_id,
+            client_id=AZURE_CLI_CLIENT_ID,
+            refresh_token=refresh_token,
+        )
+        logger.info("Using RefreshTokenCredential (delegated/user auth)")
+
+        # Monkey-patch DefaultAzureCredential in the Fabric client
+        # so that FabricClient._setup_credential uses our credential instead
+        import ms_fabric_mcp_server.client.http_client as http_client
+        original_setup = http_client.FabricClient._setup_credential
+
+        def patched_setup(self_inner):
+            self_inner._credential = credential
+            logger.debug("FabricClient using RefreshTokenCredential")
+
+        http_client.FabricClient._setup_credential = patched_setup
+
+        # Also patch the SQL service if present
+        try:
+            import ms_fabric_mcp_server.services.sql as sql_svc
+            sql_svc.DefaultAzureCredential = lambda: credential
+        except (ImportError, AttributeError):
+            pass
+    else:
+        # Fallback: map FABRIC_* env vars to AZURE_* for DefaultAzureCredential
+        if os.environ.get("FABRIC_TENANT_ID") and not os.environ.get("AZURE_TENANT_ID"):
+            os.environ["AZURE_TENANT_ID"] = os.environ["FABRIC_TENANT_ID"]
+        if os.environ.get("FABRIC_CLIENT_ID") and not os.environ.get("AZURE_CLIENT_ID"):
+            os.environ["AZURE_CLIENT_ID"] = os.environ["FABRIC_CLIENT_ID"]
+        if os.environ.get("FABRIC_CLIENT_SECRET") and not os.environ.get("AZURE_CLIENT_SECRET"):
+            os.environ["AZURE_CLIENT_SECRET"] = os.environ["FABRIC_CLIENT_SECRET"]
+        logger.info("Using DefaultAzureCredential (service principal auth)")
 
     # 1. Create the Fabric MCP server using the package's factory function
     server = create_fabric_server(name="fabric-mcp-remote")
@@ -62,7 +140,6 @@ def main():
         return JSONResponse({"status": "ok", "service": "fabric-mcp-remote"})
 
     # 4. CORS middleware — required for browser clients
-    #    Handles preflight OPTIONS before Bearer auth
     cors = [
         Middleware(
             CORSMiddleware,
@@ -74,13 +151,11 @@ def main():
         )
     ]
 
-    # 5. Run with Streamable HTTP transport on Render's PORT (uvicorn + ASGI app)
+    # 5. Run with Streamable HTTP transport on Render's PORT
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("FASTMCP_HOST", "0.0.0.0")
 
     logger.info(f"Starting Fabric MCP Remote on {host}:{port} (CORS enabled)")
-    logger.info(f"Azure auth: TENANT={os.environ.get('AZURE_TENANT_ID','NOT SET')}, "
-                f"CLIENT={os.environ.get('AZURE_CLIENT_ID','NOT SET')}")
 
     app = server.http_app(path="/mcp", middleware=cors)
     uvicorn.run(app, host=host, port=port)
