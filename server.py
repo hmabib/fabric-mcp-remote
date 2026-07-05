@@ -5,6 +5,7 @@ This wraps the existing ms-fabric-mcp-server package with:
 - Streamable HTTP transport (remote access via mcp-remote)
 - Bearer token authentication (StaticTokenVerifier)
 - CORS middleware (browser clients)
+- Azure env var mapping (FABRIC_* → AZURE_* for DefaultAzureCredential)
 - Health check endpoint for Render monitoring
 """
 
@@ -23,6 +24,19 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    # 0. Map FABRIC_* env vars to AZURE_* for DefaultAzureCredential
+    # DefaultAzureCredential reads AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+    # but our config uses FABRIC_* prefix — bridge them here
+    if os.environ.get("FABRIC_TENANT_ID") and not os.environ.get("AZURE_TENANT_ID"):
+        os.environ["AZURE_TENANT_ID"] = os.environ["FABRIC_TENANT_ID"]
+        logger.info("Mapped FABRIC_TENANT_ID → AZURE_TENANT_ID")
+    if os.environ.get("FABRIC_CLIENT_ID") and not os.environ.get("AZURE_CLIENT_ID"):
+        os.environ["AZURE_CLIENT_ID"] = os.environ["FABRIC_CLIENT_ID"]
+        logger.info("Mapped FABRIC_CLIENT_ID → AZURE_CLIENT_ID")
+    if os.environ.get("FABRIC_CLIENT_SECRET") and not os.environ.get("AZURE_CLIENT_SECRET"):
+        os.environ["AZURE_CLIENT_SECRET"] = os.environ["FABRIC_CLIENT_SECRET"]
+        logger.info("Mapped FABRIC_CLIENT_SECRET → AZURE_CLIENT_SECRET")
+
     # 1. Create the Fabric MCP server using the package's factory function
     server = create_fabric_server(name="fabric-mcp-remote")
 
@@ -65,6 +79,8 @@ def main():
     host = os.environ.get("FASTMCP_HOST", "0.0.0.0")
 
     logger.info(f"Starting Fabric MCP Remote on {host}:{port} (CORS enabled)")
+    logger.info(f"Azure auth: TENANT={os.environ.get('AZURE_TENANT_ID','NOT SET')}, "
+                f"CLIENT={os.environ.get('AZURE_CLIENT_ID','NOT SET')}")
 
     app = server.http_app(path="/mcp", middleware=cors)
     uvicorn.run(app, host=host, port=port)
