@@ -4,7 +4,7 @@ Fabric MCP Remote Server — Wrapper to expose ms-fabric-mcp-server over HTTP on
 This wraps the existing ms-fabric-mcp-server package with:
 - Streamable HTTP transport (remote access via mcp-remote)
 - Bearer token authentication (StaticTokenVerifier)
-- CORS middleware (browser clients: SOFTIS Chat PAKAZURE)
+- CORS middleware (browser clients)
 - Health check endpoint for Render monitoring
 """
 
@@ -47,8 +47,8 @@ def main():
     async def health_check(request):
         return JSONResponse({"status": "ok", "service": "fabric-mcp-remote"})
 
-    # 4. CORS — requis pour les clients navigateur (SOFTIS Chat).
-    #    Le middleware répond lui-même aux préflights OPTIONS, avant l'auth Bearer.
+    # 4. CORS middleware — required for browser clients
+    #    Handles preflight OPTIONS before Bearer auth
     cors = [
         Middleware(
             CORSMiddleware,
