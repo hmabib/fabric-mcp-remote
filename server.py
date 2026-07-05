@@ -5,13 +5,16 @@ This wraps the existing ms-fabric_mcp_server package with:
 - Streamable HTTP transport (remote access via mcp-remote)
 - Bearer token authentication (StaticTokenVerifier)
 - CORS middleware (browser clients)
-- Azure auth via refresh token (no admin consent needed)
+- Azure auth via refresh token with persistent rotation
 - Health check endpoint for Render monitoring
 """
 
 import os
+import json
+import time
 import secrets
 import logging
+import threading
 
 import uvicorn
 import msal
@@ -29,49 +32,92 @@ AZURE_CLI_CLIENT_ID = os.environ.get("AZURE_CLI_CLIENT_ID", "04b07795-8ddb-461a-
 FABRIC_SCOPES = ["https://api.fabric.microsoft.com/.default"]
 POWERBI_SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
 
+# Path to persist the rotated refresh token
+TOKEN_CACHE_FILE = os.environ.get("TOKEN_CACHE_FILE", "/tmp/azure_refresh_token.json")
+
 
 class RefreshTokenCredential:
     """Azure credential that uses a refresh token from az login.
 
-    This authenticates as the user (delegated permissions) instead of a
-    service principal (application permissions), so no admin consent is needed.
-    The refresh token is automatically rotated by MSAL.
+    - Authenticates as the user (delegated permissions), no admin consent needed.
+    - Persists rotated refresh tokens to disk so they survive server restarts.
+    - Thread-safe: uses a lock around token acquisition.
+    - Auto-refreshes 5 minutes before expiry.
     """
 
     def __init__(self, tenant_id: str, client_id: str, refresh_token: str):
         self._tenant_id = tenant_id
         self._client_id = client_id
         self._refresh_token = refresh_token
+        self._lock = threading.Lock()
+        self._cached_token = None  # (access_token, expires_on)
         authority = f"https://login.microsoftonline.com/{tenant_id}"
         self._app = msal.PublicClientApplication(
             client_id=client_id, authority=authority
         )
         logger.info(f"RefreshTokenCredential initialized for tenant {tenant_id}")
 
+    def _save_refresh_token(self, new_rt: str):
+        """Persist the rotated refresh token to disk."""
+        self._refresh_token = new_rt
+        try:
+            with open(TOKEN_CACHE_FILE, "w") as f:
+                json.dump({"refresh_token": new_rt, "updated_at": time.time()}, f)
+            logger.debug("Refresh token persisted to disk")
+        except Exception as e:
+            logger.warning(f"Failed to persist refresh token: {e}")
+
+    def _load_refresh_token(self) -> str | None:
+        """Load a previously persisted refresh token from disk."""
+        try:
+            if os.path.exists(TOKEN_CACHE_FILE):
+                with open(TOKEN_CACHE_FILE) as f:
+                    data = json.load(f)
+                rt = data.get("refresh_token")
+                if rt and len(rt) > 50:
+                    logger.info("Loaded persisted refresh token from disk")
+                    return rt
+        except Exception as e:
+            logger.warning(f"Failed to load persisted refresh token: {e}")
+        return None
+
     def get_token(self, *scopes, **kwargs):
-        """Acquire an access token using the refresh token."""
+        """Acquire an access token. Uses cached token if still valid."""
         scope_list = list(scopes) if scopes else FABRIC_SCOPES
 
-        # Try the cached refresh token
-        result = self._app.acquire_token_by_refresh_token(
-            self._refresh_token, scopes=scope_list
-        )
+        with self._lock:
+            # Return cached token if still valid (with 5 min buffer)
+            if self._cached_token:
+                token_str, expires_on = self._cached_token
+                if time.time() < expires_on - 300:
+                    return AccessToken(token_str, expires_on)
 
-        if "error" in result:
-            logger.warning(
-                f"Refresh token exchange failed: {result.get('error_description', result['error'])}"
+            # Try to load a persisted refresh token (might be newer than env var)
+            persisted_rt = self._load_refresh_token()
+            if persisted_rt:
+                self._refresh_token = persisted_rt
+
+            # Exchange refresh token for access token
+            result = self._app.acquire_token_by_refresh_token(
+                self._refresh_token, scopes=scope_list
             )
-            raise Exception(f"Auth failed: {result.get('error_description', result['error'])}")
 
-        # Save the new refresh token for next call (MSAL rotates them)
-        if "refresh_token" in result:
-            self._refresh_token = result["refresh_token"]
-            logger.debug("Refresh token rotated successfully")
+            if "error" in result:
+                error_desc = result.get("error_description", result["error"])
+                logger.error(f"Refresh token exchange failed: {error_desc[:200]}")
+                raise Exception(f"Auth failed: {error_desc}")
 
-        access_token = result["access_token"]
-        expires_in = result.get("expires_in", 3600)
-        import time
-        return AccessToken(access_token, int(time.time()) + expires_in)
+            # Save the rotated refresh token (MSAL issues a new one each time)
+            if "refresh_token" in result:
+                self._save_refresh_token(result["refresh_token"])
+
+            access_token = result["access_token"]
+            expires_in = result.get("expires_in", 3600)
+            expires_on = int(time.time()) + expires_in
+            self._cached_token = (access_token, expires_on)
+
+            logger.info(f"Access token acquired, expires in {expires_in}s")
+            return AccessToken(access_token, expires_on)
 
 
 def main():
@@ -89,9 +135,7 @@ def main():
         logger.info("Using RefreshTokenCredential (delegated/user auth)")
 
         # Monkey-patch DefaultAzureCredential in the Fabric client
-        # so that FabricClient._setup_credential uses our credential instead
         import ms_fabric_mcp_server.client.http_client as http_client
-        original_setup = http_client.FabricClient._setup_credential
 
         def patched_setup(self_inner):
             self_inner._credential = credential
