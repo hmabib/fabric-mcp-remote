@@ -24,8 +24,8 @@ from azure.core.credentials import AccessToken
 
 logger = logging.getLogger(__name__)
 
-# Azure CLI public client ID (same as az login uses)
-AZURE_CLI_CLIENT_ID = "04b07795-a71b-4346-935f-02f9a1efa4ce"
+# Azure CLI public client ID (from az login session)
+AZURE_CLI_CLIENT_ID = os.environ.get("AZURE_CLI_CLIENT_ID", "04b07795-8ddb-461a-bbee-02f9e1bf7b46")
 FABRIC_SCOPES = ["https://api.fabric.microsoft.com/.default"]
 POWERBI_SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
 
